@@ -1,635 +1,475 @@
-# # risk_bot.py
-# from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-# from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
-# import os, certifi
-
-# os.environ["SSL_CERT_FILE"] = certifi.where()
-
-# TOKEN = "7749628905:AAHtUYlgZZ1ofpWmwdZagskmZ3cLgo7zB8I"
-
-# async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     keyboard = [
-#         [InlineKeyboardButton("📊 Portfolio Risk", callback_data='risk')],
-#         [InlineKeyboardButton("🛡️ Hedge Position", callback_data='hedge')],
-#     ]
-#     reply_markup = InlineKeyboardMarkup(keyboard)
-#     await update.message.reply_text("Welcome to CryptoRiskGuard Bot 🛡️", reply_markup=reply_markup)
-
-# async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     query = update.callback_query
-#     await query.answer()
-#     if query.data == 'risk':
-#         await query.edit_message_text("📊 Risk metrics are being calculated...")
-#     elif query.data == 'hedge':
-#         await query.edit_message_text("🛡️ Setting up automatic hedge...")
-
-# if __name__ == '__main__':
-#     app = ApplicationBuilder().token(TOKEN).build()
-#     app.add_handler(CommandHandler("start", start))
-#     app.add_handler(CallbackQueryHandler(handle_buttons))
-#     app.run_polling()
-
-#-----------------------this code is for metrics added-------------
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+import database as db
 import os
 import certifi
 import ccxt
 import requests
 import json
-import ccxt
-import requests
-import config
-from config import BYBIT_API_KEY, BYBIT_SECRET
-from bybit_hedge import place_hedge_order
-application = None  # global reference
+import threading
+import asyncio
+import time
+active_monitors = {}
+# --- ASSUMED TO EXIST IN YOUR PROJECT ---
+# Make sure you have these files and they are correctly set up
+# import config 
+# from bybit_hedge import place_hedge_order
+# For this example, we will create a placeholder for place_hedge_order
+def place_hedge_order(symbol, side, qty):
+    print(f"--- MOCK HEDGE: Placing {side} order for {qty} {symbol} ---")
+    return True, f"✅ Mock hedge successful: {side} {qty} {symbol}"
+# ----------------------------------------
 
 
-
-
-user_portfolio = {
-    "BTC/USDT": {
-        "spot_qty": 0.8,
-        "perp_qty": -0.5,
-        "entry_price": 27350.0
-    },
-    "ETH/USDT": {
-        "spot_qty": 2.0,
-        "perp_qty": 0,
-        "entry_price": 1500.0
-    }
-}
-portfolio_data = {
-    "OKX": {
-        "spot_qty": 0.5,
-        "perp_qty": -0.4,
-        "entry_price": 30000
-    },
-    "Bybit": {
-        "spot_qty": 1.2,
-        "perp_qty": -1.1,
-        "entry_price": 29000
-    },
-    "Deribit": {
-        "spot_qty": 0.3,
-        "perp_qty": -0.3,
-        "entry_price": 31000
-    }
-}
+application = None
 
 
 def get_mid_price(ob):
     try:
-        print("🛠️ [DEBUG] Received OB:", ob)
-        
-        # Check keys and non-empty lists
-        if not isinstance(ob, dict):
-            print("⚠️ Not a dictionary.")
-            return None
-        
-        bids = ob.get("bids", [])
-        asks = ob.get("asks", [])
-        
-        if not bids or not asks:
-            print("⚠️ Bids or Asks empty.")
-            return None
-        
-        best_bid = bids[0][0]
-        best_ask = asks[0][0]
-        mid_price = (best_bid + best_ask) / 2
-
-        print(f"✅ Mid-price calculated: {mid_price}")
-        return mid_price
-
-    except Exception as e:
-        print("❌ [get_mid_price] Error:", e)
+        if not isinstance(ob, dict) or not ob.get("bids") or not ob.get("asks"): return None
+        return (ob["bids"][0][0] + ob["asks"][0][0]) / 2
+    except (IndexError, TypeError, KeyError) as e:
+        print(f"❌ [get_mid_price] Error: {e}")
         return None
-
-
-
 
 def compute_risk_metrics(spot_qty, perp_qty, mid_price, entry_price):
     net_position = spot_qty + perp_qty
     position_value = net_position * mid_price
     delta = net_position
-    pnl = (mid_price - entry_price) * perp_qty
+    pnl = (mid_price - entry_price) * perp_qty if entry_price else 0
     return position_value, delta, pnl
 
-# --- Risk Metrics Formatter ---
-def format_portfolio_risk(raw=False):
-    responses = []
-    structured = {}  # for raw output
-    # structured1 = {
-    #     "Bybit": {
-    #         "mid": 117642.85,
-    #         "spot_qty": 1.2,
-    #         "perp_qty": -1.1,
-    #         "value": 11764.28,
-    #         "delta": 0.6,  # 🚨 Trigger: > 0.3 delta
-    #         "pnl": -15000.00
-    #     },
-    #     "Deribit": {
-    #         "mid": 117699.75,
-    #         "spot_qty": 0.3,
-    #         "perp_qty": -0.3,
-    #         "value": 0.0,
-    #         "delta": 0.0,
-    #         "pnl": -25949.92
-    #     },
-    #     "portfolio": {
-    #         "value": 11764.28,
-    #         "delta": 0.6,  # 🚨 Trigger here too
-    #         "pnl": -40949.92,
-    #         "var": 234.86
-    #     }
-    # }
-    sources = [
-        ('Bybit', fetch_orderbook_bybit(raw=True)),
-        ('Deribit', fetch_orderbook_deribit())
-    ]
+def format_portfolio_risk(user_id, raw=False):
+    portfolio_data = db.get_portfolio(user_id)
+    if not portfolio_data:
+        return "Your portfolio is empty. Use /add_position or /sync."
+
+    responses, structured = [], {}
+    total_value, total_delta, total_pnl = 0, 0, 0
+
+    # These can be dynamic based on user's portfolio exchanges
+    sources = [('Bybit', fetch_orderbook_bybit(raw=True)), ('Deribit', fetch_orderbook_deribit())]
 
     for exchange, ob in sources:
+        if exchange not in portfolio_data: continue
+        data = portfolio_data[exchange]
+        
         if "error" in ob:
-            msg = f"❌ {exchange}: {ob['error']}"
+            msg, structured[exchange] = f"❌ {exchange}: {ob['error']}", {"error": ob["error"]}
             responses.append(msg)
-            structured[exchange] = {"error": ob["error"]}
             continue
 
         mid = get_mid_price(ob)
         if mid is None:
-            msg = f"⚠️ {exchange}: Mid-price unavailable. Skipping risk metrics."
+            msg, structured[exchange] = f"⚠️ {exchange}: Mid-price unavailable.", {"error": "Mid-price unavailable"}
             responses.append(msg)
-            structured[exchange] = {"error": "Mid-price unavailable"}
             continue
 
-        data = portfolio_data.get(exchange)
-        if data is None:
-            msg = f"⚠️ {exchange}: No portfolio data."
-            responses.append(msg)
-            structured[exchange] = {"error": "No portfolio data"}
-            continue
-
-        val, delta, pnl = compute_risk_metrics(
-            data['spot_qty'], data['perp_qty'], mid, data['entry_price']
-        )
+        val, delta, pnl = compute_risk_metrics(data['spot_qty'], data['perp_qty'], mid, data['entry_price'])
+        total_value += val
+        total_delta += delta
+        total_pnl += pnl
 
         if raw:
-            structured[exchange] = {
-                "mid_price": mid,
-                "spot_qty": data['spot_qty'],
-                "perp_qty": data['perp_qty'],
-                "value": val,
-                "delta": delta,
-                "pnl": pnl
-            }
+            structured[exchange] = {"mid_price": mid, "spot_qty": data['spot_qty'], "perp_qty": data['perp_qty'], "value": val, "delta": delta, "pnl": pnl}
         else:
-            responses.append(
-                f"📊 {exchange}:\n"
-                f"• Mid-Price: ${mid:,.2f}\n"
-                f"• Spot Qty: {data['spot_qty']}\n"
-                f"• Perp Qty: {data['perp_qty']}\n"
-                f"• Value: ${val:,.2f}\n"
-                f"• Delta: {delta:,.4f}\n"
-                f"• PnL: ${pnl:,.2f}"
-            )
+            responses.append(f"📊 *{exchange} ({data['symbol']})*:\n"
+                             f"• Mid-Price: `${mid:,.2f}`\n"
+                             f"• Spot/Perp Qty: `{data['spot_qty']}` / `{data['perp_qty']}`\n"
+                             f"• Value: `${val:,.2f}`\n"
+                             f"• Delta: `{delta:,.4f}`\n"
+                             f"• PnL: `${pnl:,.2f}`")
 
     if raw:
+        var_estimate = round(0.02 * total_value, 2)
+        structured['portfolio'] = {"value": total_value, "delta": total_delta, "pnl": total_pnl, "var": var_estimate}
         return structured
-    return "\n\n".join(responses) if responses else "⚠️ No risk data found."
-   
+    
+    return "\n\n".join(responses) if responses else "⚠️ No risk data found for your portfolio."
 
-def calculate_hedge_amount(spot_qty, perp_qty):
-    return -(spot_qty + perp_qty)  # opposite of current delta
+def calculate_dynamic_hedge(delta):
+    hedge_qty = round(abs(delta), 3) # Bybit has 3 decimal precision for BTCUSDT orders
+    MIN_QTY = 0.001
+    return max(hedge_qty, MIN_QTY)
 
-def execute_auto_hedge():
-    print("⚙️ Executing auto hedge...")
-
-    # Load portfolio data
-    data = portfolio_data.get("Bybit")
-    if not data:
-        return "❌ No portfolio data for Bybit."
-
-    ob = fetch_orderbook_bybit(raw=True)
-    if "error" in ob:
-        return f"❌ Orderbook fetch error: {ob['error']}"
-
-    mid = get_mid_price(ob)
-    if mid is None:
-        return "⚠️ Mid-price unavailable."
-
-    _, delta, _ = compute_risk_metrics(data['spot_qty'], data['perp_qty'], mid, data['entry_price'])
-
-    if abs(delta) < 0.0001:
-        return "✅ Delta already neutral. No hedge needed."
-
-    # Prepare hedge order
-    hedge_side = 'sell' if delta > 0 else 'buy'
-    hedge_qty = round(abs(delta), 3)
-
-    try:
-        bybit = ccxt.bybit({
-            'apiKey': BYBIT_API_KEY, 
-            'secret': BYBIT_SECRET,
-            'enableRateLimit': True
-        })
-
-        bybit.load_markets()
-        market = 'BTC/USDT:USDT'
-        print(f"📈 Placing {hedge_side.upper()} order for {hedge_qty} BTC on Bybit Perp...")
-        order = bybit.create_market_order(market, hedge_side, hedge_qty)
-
-        # Update portfolio data to reflect new hedge
-        if hedge_side == 'buy':
-            data['perp_qty'] += hedge_qty
-        else:
-            data['perp_qty'] -= hedge_qty
-
-        return f"✅ Hedged {hedge_qty} BTC via {hedge_side.upper()} on Bybit Perp."
-
-    except Exception as e:
-        return f"❌ Hedge order failed: {e}"
-
-
-
-import threading
-import asyncio
-import time
-import asyncio
-import threading
-import time
-application = None  
-
-
-def start_risk_scan(user_chat_id):
+def start_risk_scan(user_id: int, stop_event: threading.Event):
+    """
+    The main risk scanning loop.
+    This version is user-specific, stoppable, and uses the database correctly.
+    """
     def scan_loop():
+        # Each thread needs its own asyncio event loop
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-
-        while True:
+        
+        # The loop now checks the stop signal to terminate gracefully
+        while not stop_event.is_set():
             try:
-                print("[Risk Monitor] Scanning...")
-
-                report = format_portfolio_risk(raw=True)
-                if not isinstance(report, dict):
-                    print("[Risk Monitor] Invalid report format.")
-                    time.sleep(30)
+                print(f"[Risk Monitor] Scanning for user {user_id}...")
+                
+                risk_data = format_portfolio_risk(user_id, raw=True)
+                
+                if not isinstance(risk_data, dict):
+                    print(f"[Risk Monitor] Invalid report format for user {user_id}.")
+                    stop_event.wait(timeout=60) # Wait longer if there's an issue
                     continue
 
-                # Delta-based risk alert
-                if is_risk_high(report):
-                    print("[Alert] High delta triggered!")
-                    loop.run_until_complete(alert_telegram(
-                        user_chat_id,
-                        f"⚠️ High Delta:\n\n{format_portfolio_risk()}"
-                    ))
+                # --- Delta-based risk alert ---
+                if is_risk_high(risk_data):
+                    print(f"[Alert] High delta triggered for user {user_id}!")
+                    report_text = f"⚠️ *High Delta Alert\\!* \n\n{format_portfolio_risk(user_id)}"
+                    loop.run_until_complete(alert_telegram(user_id, report_text))
 
-                # Drawdown-based risk alert
-                total_value = report.get("total_value", 0)
-                if total_value <= 0:
-                    print("[Risk Monitor] Skipping drawdown check due to invalid total_value.")
-                    time.sleep(30)
-                    continue
+                # --- Drawdown-based risk alert (using the database) ---
+                portfolio_summary = risk_data.get("portfolio", {})
+                total_value = portfolio_summary.get("value", 0)
+                if total_value > 0:
+                    drawdown_settings = db.get_or_create_drawdown_settings(user_id)
+                    current_peak = drawdown_settings['peak_value']
+                    
+                    if total_value > current_peak:
+                        db.update_drawdown_peak(user_id, total_value)
+                        current_peak = total_value
 
-                drawdown = update_drawdown(total_value)
-                if drawdown > drawdown_data["threshold"]:
-                    print("[Alert] Drawdown threshold breached!")
-                    loop.run_until_complete(alert_telegram(
-                        user_chat_id,
-                        f"⚠️ Drawdown Alert:\n"
-                        f"Drawdown = {drawdown:.2%}\n"
-                        f"Threshold = {drawdown_data['threshold']:.2%}\n\n"
-                        f"{format_portfolio_risk()}"
-                    ))
-
+                    if current_peak > 0:
+                        drawdown = (current_peak - total_value) / current_peak
+                        if drawdown > drawdown_settings['threshold']:
+                            print(f"[Alert] Drawdown threshold breached for user {user_id}!")
+                            drawdown_esc = escape_markdown(f"{drawdown:.2%}")
+                            threshold_esc = escape_markdown(f"{drawdown_settings['threshold']:.2%}")
+                            report_text = (f"⚠️ *Drawdown Alert\\!* \n"
+                                           f"Drawdown: `{drawdown_esc}` \\(Threshold: `{threshold_esc}`\\)\n\n"
+                                           f"{format_portfolio_risk(user_id)}")
+                            loop.run_until_complete(alert_telegram(user_id, report_text))
             except Exception as e:
-                print("[ScanLoop Error]", str(e))
-
-            time.sleep(30)
+                print(f"[ScanLoop Error] for user {user_id}: {e}")
+            
+            # Wait for 30 seconds OR until the stop event is set
+            stop_event.wait(timeout=30)
+            
+        print(f"[Risk Monitor] Stopped for user {user_id}.")
 
     threading.Thread(target=scan_loop, daemon=True).start()
 
 
-
-
-def is_risk_high(risk_data):
+def is_risk_high(risk_data: dict) -> bool:
+    """Checks if the delta in the risk data exceeds the threshold."""
     try:
-        # If risk_data is a string, convert it to a dict-like fallback or skip
-        if isinstance(risk_data, str):
-            print("[Risk Check Error] Expected dict, got string.")
+        if not isinstance(risk_data, dict):
             return False
         
-        portfolio = risk_data.get("portfolio", {})
-        delta_val = portfolio.get("delta", 0)
+        portfolio_summary = risk_data.get("portfolio", {})
+        delta_val = portfolio_summary.get("delta", 0)
+        
+        # Set your delta risk threshold here
         if abs(delta_val) > 0.3:
             return True
         return False
     except Exception as e:
-        print("[Risk Check Error]", e)
+        print(f"[is_risk_high Error] {e}")
         return False
 
 
-
-async def alert_telegram(chat_id, report):
+async def alert_telegram(chat_id: int, report: str):
+    """Sends an alert message to the user using the global application instance."""
+    global application
     try:
-        await app.bot.send_message(chat_id=chat_id, text=f"⚠️ RISK THRESHOLD BREACHED:\n\n{report}")
+        if application:
+            await application.bot.send_message(chat_id=chat_id, text=report, parse_mode=ParseMode.MARKDOWN_V2)
     except Exception as e:
-        print(f"[Alert Error] {e}")
-
-async def hedge_now_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Get current risk metrics
-    risk = format_portfolio_risk(raw=True)  # raw=True returns a dict
-    delta = risk.get("delta", 0)
-
-    # Calculate required hedge qty
-    hedge_qty = calculate_dynamic_hedge(delta)
-
-    # Decide side (Buy if delta is negative, Sell if positive)
-    side = "Buy" if delta < 0 else "Sell"
-
-    # Place hedge order
-    success, message = place_hedge_order(symbol="BTCUSDT", side=side, qty=str(hedge_qty))
-
-    await update.message.reply_text(message)
+        print(f"[Alert Error] Failed to send message to {chat_id}: {e}")
 
 
-async def hedge_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    report = format_portfolio_risk()
-    if not report.strip():
-        report = "❌ No hedge data available."
-    await update.message.reply_text(f"📊 Hedge Status:\n{report}")
-
-async def monitor_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def monitor_risk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Starts the background risk monitoring for the user.
+    This function manages the 'active_monitors' dictionary.
+    """
+    global active_monitors
+    
     user_id = update.effective_chat.id
-    await update.message.reply_text("✅ Risk monitoring started. You’ll get alerts when risk thresholds are exceeded.")
-    start_risk_scan(user_id)
 
-async def auto_hedge(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🛡️ Auto-hedging activated. Currently placeholder logic.")
+    if user_id in active_monitors:
+        await update.message.reply_text("ℹ️ Risk monitoring is already active.")
+        return
 
-# hedge_utils.py
+    stop_event = threading.Event()
+    active_monitors[user_id] = stop_event
+    
+    start_risk_scan(user_id, stop_event)
+    
+    await update.message.reply_text("✅ Risk monitoring started. You'll get alerts for high delta or drawdown. Use /stop_monitor to end.")
 
-def calculate_dynamic_hedge(delta):
+
+async def stop_monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Returns hedge quantity needed to neutralize delta exposure.
-    Ensures minimum qty for Bybit (0.001 BTC).
+    Stops the background risk monitoring for the user.
+    This function also manages the 'active_monitors' dictionary.
     """
-    try:
-        hedge_qty = round(abs(delta), 4)  # Hedge against total delta directly
-
-        # Enforce exchange minimum contract size
-        MIN_QTY = 0.001
-        if hedge_qty < MIN_QTY:
-            hedge_qty = MIN_QTY
-
-        return hedge_qty
-    except Exception as e:
-        print("[HedgeCalc Error]", e)
-        return 0
-
-
-
-os.environ["SSL_CERT_FILE"] = certifi.where()
-TOKEN = "7749628905:AAHtUYlgZZ1ofpWmwdZagskmZ3cLgo7zB8I"
-
-
+    global active_monitors
+    
+    user_id = update.effective_chat.id
+    
+    if user_id in active_monitors:
+        stop_event = active_monitors[user_id]
+        stop_event.set()
+        
+        del active_monitors[user_id]
+        
+        await update.message.reply_text("✅ Risk monitoring has been stopped.")
+    else:
+        await update.message.reply_text("ℹ️ Risk monitoring is not currently active.")
 # ========== EXCHANGE FETCHERS ==========
-
-
-def fetch_orderbook_okx():
-    try:
-        okx = ccxt.okx({'enableRateLimit': True})
-        okx.load_markets()
-        ob = okx.fetch_order_book("BTC-USDT-SWAP")
-        return {
-            "exchange": "OKX",
-            "bids": ob["bids"],
-            "asks": ob["asks"]
-        }
-    except Exception as e:
-        return {"exchange": "OKX", "error": str(e)}
-
-import ccxt
-from config import BYBIT_API_KEY, BYBIT_SECRET
-def format_book(bids, asks):
-    msg = "📉 Bids:\n"
-    for price, qty in bids:
-        msg += f"• {qty:.4f} @ ${price:.2f}\n"
-
-    msg += "\n📈 Asks:\n"
-    for price, qty in asks:
-        msg += f"• {qty:.4f} @ ${price:.2f}\n"
-
-    return msg
-#     return {
-#     "delta": 0.275,
-#     "spot_size": 1.2,
-#     "details": formatted_text
-# }
-def compute_portfolio_dashboard():
-    total_val = 0
-    total_delta = 0
-    total_pnl = 0
-    summary_lines = []
-
-    for exchange in ["Bybit", "Deribit"]:
-        try:
-            ob = fetch_orderbook_bybit(raw=True) if exchange == "Bybit" else fetch_orderbook_deribit()
-            mid = get_mid_price(ob)
-            data = portfolio_data.get(exchange)
-
-            if mid is None or data is None:
-                continue
-
-            val, delta, pnl = compute_risk_metrics(
-                data['spot_qty'], data['perp_qty'], mid, data['entry_price']
-            )
-
-            total_val += val
-            total_delta += delta
-            total_pnl += pnl
-
-            summary_lines.append(
-                f"📍 {exchange}:\n"
-                f"• Mid: ${mid:,.2f}\n"
-                f"• Spot: {data['spot_qty']}, Perp: {data['perp_qty']}\n"
-                f"• Value: ${val:,.2f}\n"
-                f"• Delta: {delta:.4f}, PnL: ${pnl:.2f}\n"
-            )
-
-        except Exception as e:
-            summary_lines.append(f"❌ {exchange} error: {e}")
-
-    var_estimate = round(0.02 * total_val, 2)  # Simplified 2% VaR
-
-    summary_lines.append("\n📊 Portfolio Summary:")
-    summary_lines.append(f"• Total Value: ${total_val:,.2f}")
-    summary_lines.append(f"• Total Delta: {total_delta:.4f}")
-    summary_lines.append(f"• Total PnL: ${total_pnl:,.2f}")
-    summary_lines.append(f"• Estimated VaR (2%): ${var_estimate:,.2f}")
-
-    return "\n".join(summary_lines)
-
+os.environ["SSL_CERT_FILE"] = certifi.where()
+TOKEN = "7749628905:AAHtUYlgZZ1ofpWmwdZagskmZ3cLgo7zB8I"  # Replace with your bot token
 
 def fetch_orderbook_bybit(raw=False):
     try:
         bybit = ccxt.bybit({'enableRateLimit': True})
-        bybit.load_markets()
         ob = bybit.fetch_order_book("BTC/USDT")
-        
-        if raw:
-            return {
-                "exchange": "Bybit",
-                "bids": ob["bids"],
-                "asks": ob["asks"]
-            }
-        
-        # For normal display
-        formatted = "🟡 Bybit\n📉 Bids:\n" + \
-            "\n".join([f"• {b[1]:.4f} @ ${b[0]:,.2f}" for b in ob["bids"][:2]])
-        formatted += "\n\n📈 Asks:\n" + \
-            "\n".join([f"• {a[1]:.4f} @ ${a[0]:,.2f}" for a in ob["asks"][:2]])
-        
-        return formatted
-
+        return {"exchange": "Bybit", "bids": ob["bids"], "asks": ob["asks"]}
     except Exception as e:
-        if raw:
-            return {"exchange": "Bybit", "error": str(e)}
-        return f"❌ Bybit Error: {e}"
-
-
-
+        return {"exchange": "Bybit", "error": str(e)}
 
 def fetch_orderbook_deribit():
     try:
         url = "https://www.deribit.com/api/v2/public/get_order_book?instrument_name=BTC-PERPETUAL"
-        response = requests.get(url)
+        response = requests.get(url, timeout=5)
+        response.raise_for_status()
         data = response.json()["result"]
-        return {
-            "exchange": "Deribit",
-            "bids": data["bids"],
-            "asks": data["asks"]
-        }
+        return {"exchange": "Deribit", "bids": data["bids"], "asks": data["asks"]}
     except Exception as e:
         return {"exchange": "Deribit", "error": str(e)}
-drawdown_data = {
-    "peak_value": 0,
-    "max_drawdown": 0,
-    "threshold": 0.10  # 10% default
-}
-
-def update_drawdown(current_value):
-    if current_value > drawdown_data["peak_value"]:
-        drawdown_data["peak_value"] = current_value
-
-    if drawdown_data["peak_value"] == 0:
-        return 0
-
-    drawdown = (drawdown_data["peak_value"] - current_value) / drawdown_data["peak_value"]
-    drawdown_data["max_drawdown"] = max(drawdown_data["max_drawdown"], drawdown)
-
-    return drawdown
-
-
 
 # ========== TELEGRAM HANDLERS ==========
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("📊 Portfolio Risk", callback_data='risk')],
-        [InlineKeyboardButton("🛡️ Hedge Position", callback_data='hedge')],
-    ]
+    db.get_or_create_drawdown_settings(update.effective_chat.id) # Ensure user exists in drawdown table
+    keyboard = [[InlineKeyboardButton("📊 Portfolio Risk", callback_data='risk')], [InlineKeyboardButton("🛡️ Hedge Position", callback_data='hedge')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Welcome to CryptoRiskGuard Bot 🛡️", reply_markup=reply_markup)
+    await update.message.reply_text("Welcome to CryptoRiskGuard Bot 🛡️\n"
+                                    "Use /view_portfolio, /add_position, /sync, and /add_api to manage your data.", reply_markup=reply_markup)
 
-async def portfolio_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    report = compute_portfolio_dashboard()
-    await update.message.reply_text(report)
+async def portfolio_dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_chat.id
+    risk_data = format_portfolio_risk(user_id, raw=True)
+    if isinstance(risk_data, str):
+        await update.message.reply_text(risk_data)
+        return
+    
+    summary = risk_data.get('portfolio', {})
+    report = (f"📊 *Portfolio Dashboard*\n\n"
+              f"• Total Value: `${summary.get('value', 0):,.2f}`\n"
+              f"• Total Delta: `{summary.get('delta', 0):,.4f}`\n"
+              f"• Total PnL: `${summary.get('pnl', 0):,.2f}`\n"
+              f"• Est. VaR (2%): `${summary.get('var', 0):,.2f}`\n\n"
+              f"*{'-'*20}*\n\n"
+              f"{format_portfolio_risk(user_id)}") # Append detailed breakdown
+    await update.message.reply_text(report, parse_mode=ParseMode.MARKDOWN)
 
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
+    user_id = query.from_user.id 
+    
     if query.data == "risk":
-        risk_report = format_portfolio_risk()
-        if not risk_report.strip():
-            risk_report = "❌ No risk data available."
-        await query.edit_message_text(risk_report)
-
-    # elif query.data == "hedge":
-    #  await query.edit_message_text("🛡️ Placing hedge order...")
-
-    # # Example: Buy 0.001 BTC at $10000
-    # success, message = place_hedge_order(symbol="BTCUSDT", side="Buy", qty="0.001")
-   
+        risk_report = format_portfolio_risk(user_id)
+        await query.edit_message_text(risk_report, parse_mode=ParseMode.MARKDOWN)
     elif query.data == "hedge":
-           await query.edit_message_text("🛡️ Placing dynamic hedge...")
+        await query.edit_message_text("🛡️ Calculating dynamic hedge...")
+        risk_data = format_portfolio_risk(user_id, raw=True)
+        if isinstance(risk_data, str):
+            await context.bot.send_message(chat_id=user_id, text=f"❌ Cannot hedge: {risk_data}")
+            return
+        current_delta = risk_data.get('portfolio', {}).get('delta', 0)
+        if abs(current_delta) < 0.001:
+            await context.bot.send_message(chat_id=user_id, text="✅ Delta is neutral. No hedge needed.")
+            return
+        qty, side = calculate_dynamic_hedge(current_delta), "Sell" if current_delta > 0 else "Buy"
+        success, message = place_hedge_order(symbol="BTCUSDT", side=side, qty=str(qty))
+        await context.bot.send_message(chat_id=user_id, text=message)
 
-        # Step 1: Get current delta
-           risk = format_portfolio_risk(raw=True)  # You must return dict with delta
-           current_delta = risk.get("delta", 0)
-           spot_size = risk.get("spot_size", 1)  # default to 1 BTC if not available
+# --- REPLACEMENT hedge_status_command ---
+async def hedge_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Provides a preview of the hedge action without executing it."""
+    user_id = update.effective_chat.id
+    await update.message.reply_text("🔎 Checking hedge status...")
 
-        # Step 2: Calculate hedge qty
-           qty = calculate_dynamic_hedge(current_delta)
+    risk_data = format_portfolio_risk(user_id, raw=True)
+    if isinstance(risk_data, str):
+        # We will NOT use any markdown here to be safe
+        await update.message.reply_text(f"❌ Cannot check status: {risk_data}")
+        return
 
-        # Step 3: Place hedge
-           success, message = place_hedge_order(
-            symbol="BTCUSDT", side="Sell" if current_delta > 0 else "Buy", qty=str(qty)
+    current_delta = risk_data.get('portfolio', {}).get('delta', 0)
+    
+    # --- NEUTRAL STATUS ---
+    if abs(current_delta) < 0.001:
+        # NO MARKDOWN
+        report = (
+            f"Hedge Status: Delta Neutral\n\n"
+            f"Your current total delta is {current_delta:.4f}.\n"
+            f"No hedge action is required."
         )
+        await update.message.reply_text(report) # NO PARSE MODE
+        return
 
-           await context.bot.send_message(chat_id=update.effective_chat.id, text=message)
+    # --- ACTION REQUIRED STATUS ---
+    qty_to_hedge = calculate_dynamic_hedge(current_delta)
+    side_to_hedge = "Sell" if current_delta > 0 else "Buy"
 
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=message
+    # NO MARKDOWN
+    report = (
+        f"Hedge Status: Action Required\n\n"
+        f"Your current total delta is {current_delta:.4f}.\n\n"
+        f"Proposed Hedge Action:\n"
+        f"  - Side: {side_to_hedge}\n"
+        f"  - Quantity: {qty_to_hedge:.3f} BTC\n\n"
+        f"To execute this trade, run /hedge_now or use the inline button."
     )
+    await update.message.reply_text(report) # NO PARSE MODE
 
-async def set_drawdown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def escape_markdown(text: str) -> str:
+    """Helper function to escape telegram markdown v2 characters."""
+    # Note: We escape a specific set of characters required by Telegram's MarkdownV2
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return ''.join(f'\\{char}' if char in escape_chars else char for char in str(text))
+async def hedge_now_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Executes the hedge action immediately."""
+    user_id = update.effective_chat.id
+    await update.message.reply_text("🛡️ Executing hedge now...")
+
+    risk_data = format_portfolio_risk(user_id, raw=True)
+    if isinstance(risk_data, str):
+        await update.message.reply_text(f"❌ Cannot hedge: {risk_data}")
+        return
+
+    current_delta = risk_data.get('portfolio', {}).get('delta', 0)
+    
+    if abs(current_delta) < 0.001:
+        await update.message.reply_text("✅ Delta is already neutral. No hedge needed.")
+        return
+
+    qty = calculate_dynamic_hedge(current_delta)
+    side = "Sell" if current_delta > 0 else "Buy"
+
+    # This calls your existing function to place the order
+    success, message = place_hedge_order(symbol="BTCUSDT", side=side, qty=str(qty))
+    
+    # Send the result back to the user
+    await update.message.reply_text(message)
+async def set_drawdown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_chat.id
     try:
         threshold = float(context.args[0])
-        drawdown_data["threshold"] = threshold
+        if not (0 < threshold < 1): raise ValueError("Threshold must be between 0 and 1.")
+        db.set_drawdown_threshold(user_id, threshold)
         await update.message.reply_text(f"✅ Drawdown alert threshold set to {threshold:.2%}")
-    except:
-        await update.message.reply_text("❌ Usage: /set_drawdown <value>. Example: /set_drawdown 0.1")
+    except (ValueError, IndexError):
+        # --- MODIFIED: Cleaned up usage string for MARKDOWN_V2 ---
+        usage = (
+            "❌ *Invalid Usage*\n"
+            "Usage: `/set_drawdown <value>`\n"
+            "Example: `/set_drawdown 0.15` for 15%"
+        )
+        await update.message.reply_text(usage, parse_mode=ParseMode.MARKDOWN_V2)
 
+# --- NEW COMMANDS FOR PORTFOLIO & API MANAGEMENT ---
+async def view_portfolio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    report = format_portfolio_risk(update.effective_chat.id)
+    await update.message.reply_text(report, parse_mode=ParseMode.MARKDOWN)
 
+async def add_position_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id, args = update.effective_chat.id, context.args
+    # --- MODIFIED: Cleaned up usage string for MARKDOWN_V2 ---
+    usage = (
+        "Usage: `/add_position <Exchange> <Symbol> <SpotQty> <PerpQty> <Entry>`\n"
+        "Example: `/add_position Bybit BTC/USDT 1.2 -1.1 29000`"
+    )
+    if len(args) != 5:
+        # --- MODIFIED: Using MARKDOWN_V2 ---
+        await update.message.reply_text(usage, parse_mode=ParseMode.MARKDOWN_V2)
+        return
+    try:
+        exchange, symbol, spot_qty, perp_qty, entry = args
+        db.add_or_update_position(user_id, exchange.title(), symbol.upper(), float(spot_qty), float(perp_qty), float(entry))
+        await update.message.reply_text(f"✅ Position for {symbol.upper()} on {exchange.title()} saved.")
+    except ValueError:
+        await update.message.reply_text(f"Invalid number format.\n\n{usage}", parse_mode=ParseMode.MARKDOWN_V2)
 
+async def remove_position_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id, args = update.effective_chat.id, context.args
+    # --- MODIFIED: Cleaned up usage string for MARKDOWN_V2 ---
+    usage = (
+        "Usage: `/remove_position <Exchange> <Symbol>`\n"
+        "Example: `/remove_position Bybit BTC/USDT`"
+    )
+    if len(args) != 2:
+        # --- MODIFIED: Using MARKDOWN_V2 ---
+        await update.message.reply_text(usage, parse_mode=ParseMode.MARKDOWN_V2)
+        return
+    exchange, symbol = args
+    db.remove_position(user_id, exchange.title(), symbol.upper())
+    await update.message.reply_text(f"✅ Position for {symbol.upper()} on {exchange.title()} removed.")
+
+async def add_api_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id, args = update.effective_chat.id, context.args
+    # --- MODIFIED: Cleaned up usage string for MARKDOWN_V2 ---
+    usage = (
+        "Usage: `/add_api <Exchange> <ApiKey> <SecretKey>`\n\n"
+        "⚠️ *Warning: API keys are stored in a local database\\.*" # Note the escaped dot
+    )
+    if len(args) != 3:
+        # --- MODIFIED: Using MARKDOWN_V2 ---
+        await update.message.reply_text(usage, parse_mode=ParseMode.MARKDOWN_V2)
+        return
+    exchange, api_key, secret = args
+    db.save_api_keys(user_id, exchange.title(), api_key, secret)
+    await update.message.reply_text(f"✅ API keys for {exchange.title()} saved. Use `/sync` to fetch positions.")
+
+async def sync_bybit_portfolio(user_id):
+    keys = db.get_api_keys(user_id, "Bybit")
+    if not keys: return "No Bybit API keys found. Use /add_api."
+    try:
+        bybit = ccxt.bybit({**keys, 'options': {'defaultType': 'swap'}})
+        positions = bybit.fetch_positions(params={'category': 'linear'})
+        btc_perp = next((p for p in positions if p['info']['symbol'] == 'BTCUSDT'), None)
+        perp_qty = float(btc_perp['contracts']) * (-1 if btc_perp['side'] == 'short' else 1) if btc_perp else 0
+        entry_price = float(btc_perp['entryPrice']) if btc_perp else 0
+        balances = bybit.fetch_balance(params={'accountType': 'UNIFIED'})
+        spot_qty = float(balances.get('BTC', {}).get('total', 0))
+        db.add_or_update_position(user_id, "Bybit", "BTC/USDT", spot_qty, perp_qty, entry_price)
+        return f"✅ *Bybit Sync Complete:*\n  - Spot: `{spot_qty}` BTC\n  - Perp: `{perp_qty}` BTC"
+    except Exception as e:
+        return f"❌ *Bybit Sync Failed:*\n`{str(e)}`"
+
+async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_chat.id
+    await update.message.reply_text("🔄 Syncing portfolio from exchanges...")
+    bybit_status = await sync_bybit_portfolio(user_id)
+    await update.message.reply_text(bybit_status, parse_mode=ParseMode.MARKDOWN)
 
 # ========== BOOTSTRAP BOT ==========
-
 if __name__ == "__main__":
-    app = ApplicationBuilder().token(TOKEN).build()
-    print("Bot is running... Visit Telegram and click your buttons")
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("monitor_risk", monitor_risk))
-    app.add_handler(CommandHandler("hedge_status", hedge_status))
-    app.add_handler(CommandHandler("hedge_now", hedge_now_command))
-    app.add_handler(CommandHandler("dashboard", portfolio_dashboard))
-    app.add_handler(CommandHandler("set_drawdown", set_drawdown))
+    db.init_db()
+    app_builder = ApplicationBuilder().token(TOKEN)
+    application = app_builder.build()
+    print("Bot is running...")
 
-
-    app.add_handler(CallbackQueryHandler(handle_buttons))
-
-   
-    app.run_polling()
-
-
-
-
-
-
-
-
-
-
-
-# import httpx
-# import certifi
-
-# client = httpx.Client(verify=certifi.where())
-# try:
-#     r = client.get("https://api.telegram.org/bot7749628905:AAHtUYlgZZ1ofpWmwdZagskmZ3cLgo7zB8I/getMe")
-#     print(r.status_code)
-#     print(r.text)
-# except Exception as e:
-#     print("Connection failed:", e)
+    handlers = [
+        CommandHandler("start", start),
+        CommandHandler("dashboard", portfolio_dashboard_command),
+        CommandHandler("monitor_risk", monitor_risk_command),
+        CommandHandler("hedge_status", hedge_status_command),
+        CommandHandler("hedge_now", hedge_now_command),
+        CommandHandler("stop_monitor", stop_monitor_command),
+        CommandHandler("set_drawdown", set_drawdown_command),
+        CommandHandler("view_portfolio", view_portfolio_command),
+        CommandHandler("add_position", add_position_command),
+        CommandHandler("remove_position", remove_position_command),
+        CommandHandler("add_api", add_api_command),
+        CommandHandler("sync", sync_command),
+        CallbackQueryHandler(handle_buttons)
+    ]
+    application.add_handlers(handlers)
+    application.run_polling()
